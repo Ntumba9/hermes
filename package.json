@@ -8,6 +8,7 @@
     "api": "tsx src/api.ts",
     "worker": "tsx src/worker.ts",
     "receiver": "tsx src/receiver.ts",
+    "chaos": "tsx src/chaos.ts",
     "test": "node --import tsx --test src/**/*.test.ts"
   },
   "dependencies": {
