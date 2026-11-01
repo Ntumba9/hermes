@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { pool } from "./db.js";
+import { sign } from "./signing.js";
 
 const RECEIVER_URL = "http://127.0.0.1:4000/receive"; // local-only allowlisted target
 const LEASE_SECONDS = 30;
@@ -62,11 +63,16 @@ async function claimOne(): Promise<ClaimedEvent | null> {
 }
 
 async function deliver(event: ClaimedEvent): Promise<boolean> {
+  const body = JSON.stringify(event.payload);
   try {
     const res = await fetch(RECEIVER_URL, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-event-id": event.id },
-      body: JSON.stringify(event.payload),
+      headers: {
+        "content-type": "application/json",
+        "x-event-id": event.id,
+        "x-hermes-signature": sign(body),
+      },
+      body,
     });
     return res.ok;
   } catch {
