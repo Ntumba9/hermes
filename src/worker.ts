@@ -4,13 +4,24 @@ import { pool } from "./db.js";
 const RECEIVER_URL = "http://127.0.0.1:4000/receive"; // local-only allowlisted target
 const LEASE_SECONDS = 30;
 const POLL_INTERVAL_MS = 500;
+const MAX_ATTEMPTS = 8;
+const BACKOFF_BASE_SECONDS = 2;
+const BACKOFF_CAP_SECONDS = 60;
 
 type ClaimedEvent = {
   id: string;
   idempotency_key: string;
   payload: unknown;
+  attempts: number;
   lease_token: string;
 };
+
+// Full jitter: pick uniformly between 0 and the exponential cap, so a batch of
+// jobs that failed together don't all retry on the same tick.
+function backoffSeconds(nextAttemptNumber: number): number {
+  const cap = Math.min(BACKOFF_CAP_SECONDS, BACKOFF_BASE_SECONDS * 2 ** (nextAttemptNumber - 1));
+  return Math.random() * cap;
+}
 
 // Claim one pending job: lock it, stamp a fresh lease token, commit, then let the
 // caller do the network call outside this transaction. SKIP LOCKED means a second
@@ -20,7 +31,7 @@ async function claimOne(): Promise<ClaimedEvent | null> {
   try {
     await client.query("BEGIN");
     const { rows } = await client.query<ClaimedEvent>(
-      `SELECT id, idempotency_key, payload
+      `SELECT id, idempotency_key, payload, attempts
        FROM events
        WHERE status = 'pending' AND next_attempt_at <= now()
        ORDER BY created_at
@@ -68,18 +79,30 @@ async function deliver(event: ClaimedEvent): Promise<boolean> {
 // is different, the WHERE matches zero rows, and this stale write is a no-op.
 async function markDelivered(event: ClaimedEvent): Promise<void> {
   await pool.query(
-    `UPDATE events SET status = 'delivered', attempts = attempts + 1
-     WHERE id = $1 AND lease_token = $2`,
-    [event.id, event.lease_token]
+    `UPDATE events SET status = 'delivered', attempts = $1
+     WHERE id = $2 AND lease_token = $3`,
+    [event.attempts + 1, event.id, event.lease_token]
   );
 }
 
 async function markFailed(event: ClaimedEvent): Promise<void> {
+  const nextAttemptNumber = event.attempts + 1;
+
+  if (nextAttemptNumber >= MAX_ATTEMPTS) {
+    await pool.query(
+      `UPDATE events SET status = 'dead', attempts = $1
+       WHERE id = $2 AND lease_token = $3`,
+      [nextAttemptNumber, event.id, event.lease_token]
+    );
+    return;
+  }
+
   await pool.query(
     `UPDATE events
-     SET status = 'pending', attempts = attempts + 1, next_attempt_at = now() + interval '2 seconds'
-     WHERE id = $1 AND lease_token = $2`,
-    [event.id, event.lease_token]
+     SET status = 'pending', attempts = $1,
+         next_attempt_at = now() + ($2 * interval '1 second')
+     WHERE id = $3 AND lease_token = $4`,
+    [nextAttemptNumber, backoffSeconds(nextAttemptNumber), event.id, event.lease_token]
   );
 }
 
