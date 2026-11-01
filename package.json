@@ -1,0 +1,22 @@
+{
+  "name": "hermes",
+  "version": "0.1.0",
+  "description": "Crash-tested webhook delivery service",
+  "type": "module",
+  "scripts": {
+    "migrate": "tsx src/migrate.ts",
+    "api": "tsx src/api.ts",
+    "worker": "tsx src/worker.ts",
+    "receiver": "tsx src/receiver.ts",
+    "test": "node --import tsx --test src/**/*.test.ts"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
