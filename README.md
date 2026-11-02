@@ -45,20 +45,20 @@ In three terminals:
 
 ```bash
 npm run receiver   # demo delivery target on :4000
-npm run api        # ingest API on :3000
+npm run api        # ingest API on :3500
 npm run worker     # claims and delivers pending events
 ```
 
 Send an event:
 
 ```bash
-curl -X POST http://127.0.0.1:3000/events \
+curl -X POST http://127.0.0.1:3500/events \
   -H "Idempotency-Key: demo-1" \
   -H "Content-Type: application/json" \
   -d '{"amount":1}'
 ```
 
-Check dead letters: `curl http://127.0.0.1:3000/events?status=dead`
+Check dead letters: `curl http://127.0.0.1:3500/events?status=dead`
 
 Check the receiver's side-effect total (should only ever move once per event,
 even if delivery repeats): `curl http://127.0.0.1:4000/total`

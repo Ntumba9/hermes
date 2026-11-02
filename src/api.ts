@@ -2,7 +2,7 @@ import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { pool } from "./db.js";
 
-const PORT = 3000;
+const PORT = 3500;
 const HOST = "127.0.0.1";
 
 async function readBody(req: import("node:http").IncomingMessage): Promise<string> {
@@ -83,6 +83,11 @@ async function handleListEvents(
   res.writeHead(200, { "content-type": "application/json" });
   res.end(JSON.stringify(result.rows));
 }
+
+server.on("error", (err) => {
+  console.error(`API failed to start: ${err.message}`);
+  process.exit(1);
+});
 
 server.listen(PORT, HOST, () => {
   console.log(`HERMES API listening on http://${HOST}:${PORT}`);

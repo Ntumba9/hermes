@@ -81,6 +81,11 @@ async function handleReceive(
   res.end(JSON.stringify({ ok: true }));
 }
 
+server.on("error", (err) => {
+  console.error(`Receiver failed to start: ${err.message}`);
+  process.exit(1);
+});
+
 server.listen(PORT, HOST, () => {
   console.log(`Demo receiver listening on http://${HOST}:${PORT}`);
 });
