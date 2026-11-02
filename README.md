@@ -72,9 +72,34 @@ npm run chaos
 
 `npm test` runs the dependency-free unit tests (HMAC sign/verify).
 
+Throughput benchmark — sends 1000 events, runs one worker with no kills, times
+send-start to the last event reaching a terminal state:
+
+```bash
+npm run benchmark
+```
+
 An optional `HERMES_SIGNING_SECRET` env var overrides the dev-only default secret
 used to sign/verify delivery payloads; set the same value for anything that needs
 to verify HERMES's signatures.
+
+## Benchmark
+
+Single worker, single poller, local receiver, no concurrency — measures the
+mechanism's floor, not an optimized ceiling:
+
+| Events | Elapsed | Throughput |
+|--------|---------|------------|
+| 1000   | 35.8s   | 27.9 events/sec |
+
+That number is bound by the worker doing one job fully sequentially — claim
+(transaction + commit), HTTP POST, mark-result (another write) — before
+polling for the next one, with a 500ms poll delay whenever it finds nothing
+to do. Running multiple worker processes against the same table is the
+obvious next lever: `SELECT ... FOR UPDATE SKIP LOCKED` is exactly what makes
+that safe without any coordination between them, since two workers polling
+concurrently just skip each other's locked rows. Not benchmarked here —
+tonight's slice was proving correctness under crash, not peak throughput.
 
 ## Status
 
@@ -85,8 +110,7 @@ dead-lettering after 8 attempts, HMAC-SHA256 signing, and durable receiver-side
 dedup (event id + side effect in one transaction). `npm run chaos` passes
 consistently: 50/50 events delivered, zero lost, side-effect total exactly 50
 across repeated random SIGKILLs of the worker, with observed redeliveries
-correctly deduped. Benchmark numbers and the "what I learned" writeup are
-still open.
+correctly deduped. Benchmarked at 27.9 events/sec with a single worker.
 
 ## What works / limitations (updated each session)
 
@@ -103,8 +127,45 @@ backoff + dead-letter, HMAC sign/verify, receiver dedup. `npm test` (4/4) and
 SIGKILLs) was tuned by hand against one machine's `tsx` cold-start overhead,
 not derived from first principles - a much faster or slower machine might need
 different numbers to actually interrupt mid-flight work instead of mostly
-killing process startup. The first run of the chaos test also caught a real
-bug (expired leases were never reclaimed, so a worker killed right after
-claiming a job orphaned it forever) - a reminder that "written and
-type-checked" and "actually correct" are different claims, which is the whole
-point of this project. Benchmark numbers (events/sec) are not yet measured.
+killing process startup. The benchmark (27.9 events/sec) is a single
+unoptimized worker, not a ceiling - it was never the point of this project to
+push that number up.
+
+## What I learned
+
+**The chaos test found a bug the type checker and unit tests couldn't.**
+`claimOne()` only ever selected `status = 'pending'`. A worker SIGKILLed
+right after committing a row to `'claimed'`, but before it could write a
+result, left that row permanently stuck - nothing anywhere ever reset it,
+despite `lease_expires_at` existing for exactly this purpose. Everything
+compiled, every unit test passed, and the bug still shipped, because none of
+that exercises concurrent crash timing. Only throwing real SIGKILLs at a real
+worker against a real Postgres instance surfaced it. That's the actual thesis
+of this project, not a thing I wrote in the README to sound reflective: you
+cannot reason your way to "this survives a crash," you have to crash it and
+check.
+
+**The lease-token pattern is a cheap way to turn "which worker still owns
+this job" into one `WHERE` clause.** I expected to need something heavier -
+a separate leases table, maybe a watchdog process - to handle a worker dying
+mid-flight. Instead, every status write already carries `WHERE id = $1 AND
+lease_token = $2`; a stale worker's write just silently matches zero rows.
+The reclaim logic (broadening the claim query to also pick up
+`status = 'claimed' AND lease_expires_at <= now()`) was the one piece I had
+to add by hand, and it's three lines.
+
+**At-least-once delivery is the easy half of "exactly-once behavior."**
+Making the worker resend was never the hard part - not committing the status
+write inside the same transaction as the HTTP call is what forces at-least-
+once, and that's a one-line decision. The hard part was making redelivery
+harmless on the receiving end: the receiver's own `INSERT ... ON CONFLICT DO
+NOTHING RETURNING` has to run in the same transaction as the side effect it
+gates, or a crash between those two statements reopens the exact bug this
+whole design exists to prevent.
+
+**Full jitter mattered more than I expected for something I almost skipped.**
+Early on I nearly used plain exponential backoff (no randomization) since it
+"obviously" fixes retry storms. It doesn't, on its own - a batch of events
+that all fail together still retries in lockstep, just on a longer delay.
+`Math.random() * cap` instead of a fixed delay per attempt is what actually
+spreads the batch out.
