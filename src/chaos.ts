@@ -6,12 +6,12 @@ import { pool } from "./db.js";
 // and restarts it, until every event reaches a terminal state. Asserts zero
 // lost events and that the receiver's side effect ran exactly once per event.
 const NUM_EVENTS = 50;
-const API_URL = "http://127.0.0.1:3000/events";
+const API_URL = "http://127.0.0.1:3500/events";
 const RECEIVER_TOTAL_URL = "http://127.0.0.1:4000/total";
-const KILL_MIN_MS = 150;
-const KILL_MAX_MS = 1200;
+const KILL_MIN_MS = 400; // tsx cold start + DB connect takes real time; much below this and kills land before any claim happens
+const KILL_MAX_MS = 2500;
 const POLL_INTERVAL_MS = 300;
-const STALL_TIMEOUT_MS = 30_000; // no progress for this long => fail instead of hanging forever
+const STALL_TIMEOUT_MS = 25_000; // > worker's lease window, so a stuck claim has time to be reclaimed
 
 function spawnTsx(entry: string): ChildProcess {
   return spawn(process.execPath, ["--import", "tsx", entry], {

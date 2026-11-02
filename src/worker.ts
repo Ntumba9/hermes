@@ -3,7 +3,7 @@ import { pool } from "./db.js";
 import { sign } from "./signing.js";
 
 const RECEIVER_URL = "http://127.0.0.1:4000/receive"; // local-only allowlisted target
-const LEASE_SECONDS = 30;
+const LEASE_SECONDS = 5;
 const POLL_INTERVAL_MS = 500;
 const MAX_ATTEMPTS = 8;
 const BACKOFF_BASE_SECONDS = 2;
@@ -24,9 +24,13 @@ function backoffSeconds(nextAttemptNumber: number): number {
   return Math.random() * cap;
 }
 
-// Claim one pending job: lock it, stamp a fresh lease token, commit, then let the
-// caller do the network call outside this transaction. SKIP LOCKED means a second
-// worker polling concurrently just moves on to the next row instead of blocking.
+// Claim one job: either a fresh pending one, or a 'claimed' one whose lease
+// expired (its worker died after claiming but before marking a result - that
+// row's status never moved back to 'pending' on its own, so this is the only
+// path back to delivery). Lock it, stamp a fresh lease token, commit, then let
+// the caller do the network call outside this transaction. SKIP LOCKED means a
+// second worker polling concurrently just moves on to the next row instead of
+// blocking.
 async function claimOne(): Promise<ClaimedEvent | null> {
   const client = await pool.connect();
   try {
@@ -34,7 +38,8 @@ async function claimOne(): Promise<ClaimedEvent | null> {
     const { rows } = await client.query<ClaimedEvent>(
       `SELECT id, idempotency_key, payload, attempts
        FROM events
-       WHERE status = 'pending' AND next_attempt_at <= now()
+       WHERE (status = 'pending' AND next_attempt_at <= now())
+          OR (status = 'claimed' AND lease_expires_at <= now())
        ORDER BY created_at
        LIMIT 1
        FOR UPDATE SKIP LOCKED`
