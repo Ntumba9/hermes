@@ -78,23 +78,33 @@ to verify HERMES's signatures.
 
 ## Status
 
-All of tonight's slice and week-core mechanism is written: idempotent ingest,
-SKIP LOCKED + lease-token claiming, exponential backoff with jitter and
+Tonight's slice and week-core mechanism are built and verified end to end:
+idempotent ingest, SKIP LOCKED + lease-token claiming (including reclaiming a
+job whose worker died mid-flight), exponential backoff with jitter and
 dead-lettering after 8 attempts, HMAC-SHA256 signing, and durable receiver-side
-dedup (event id + side effect in one transaction). The chaos test and its GitHub
-Actions workflow are written too. Benchmark numbers and the "what I learned"
-writeup are still open.
+dedup (event id + side effect in one transaction). `npm run chaos` passes
+consistently: 50/50 events delivered, zero lost, side-effect total exactly 50
+across repeated random SIGKILLs of the worker, with observed redeliveries
+correctly deduped. Benchmark numbers and the "what I learned" writeup are
+still open.
 
 ## What works / limitations (updated each session)
 
-See commit history for the running log, including which commits are marked
-UNVERIFIED.
+See commit history for the running log.
 
-**Current honest limitation:** none of the Postgres-dependent code has actually
-been run. Docker Desktop on this machine is stuck behind an orphaned Windows
-AF_UNIX socket reparse point (`sailor-ingest.sock` / `.stale` in
-`%LOCALAPPDATA%\Docker\run`) that nothing — not killing the process, not
-`wsl --shutdown`, not deleting the file — can clear short of a reboot. Everything
-above is `tsc --noEmit`-clean and reviewed by hand, but the actual delivery
-guarantee this project exists to prove has not yet been demonstrated end to end.
-First thing to do once Docker is back: `npm run migrate && npm run chaos`.
+**What works (verified against a real Postgres, not just type-checked):**
+idempotent ingest, claim/lease/deliver/mark-result, expired-lease reclaim,
+backoff + dead-letter, HMAC sign/verify, receiver dedup. `npm test` (4/4) and
+`npm run chaos` both pass.
+
+**How to run the proof:** `docker compose up -d && npm run migrate && npm run chaos`.
+
+**Honest limitation:** the chaos test's kill timing (400ms-2.5s between
+SIGKILLs) was tuned by hand against one machine's `tsx` cold-start overhead,
+not derived from first principles - a much faster or slower machine might need
+different numbers to actually interrupt mid-flight work instead of mostly
+killing process startup. The first run of the chaos test also caught a real
+bug (expired leases were never reclaimed, so a worker killed right after
+claiming a job orphaned it forever) - a reminder that "written and
+type-checked" and "actually correct" are different claims, which is the whole
+point of this project. Benchmark numbers (events/sec) are not yet measured.
