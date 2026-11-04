@@ -1,7 +1,7 @@
 # HERMES
 
 A crash-tested webhook delivery service, with a live dashboard that shows
-the delivery mechanism working — and breaking, and recovering — in real
+the delivery mechanism working and breaking, and recovering — in real
 time. Postgres as the queue, no Kafka/Redis/RabbitMQ, no ORM. The point is
 proving delivery survives a worker crash, not feature count.
 
