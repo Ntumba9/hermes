@@ -16,5 +16,47 @@ services:
       timeout: 2s
       retries: 20
 
+  receiver:
+    build: .
+    command: sh -c "npm run migrate && npm run receiver"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      BIND_HOST: "0.0.0.0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # no host port published - only reachable from other containers on the
+    # compose network, reducing the demo's exposed surface
+
+  api:
+    build: .
+    command: sh -c "npm run migrate && npm run api"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      BIND_HOST: "0.0.0.0"
+    ports:
+      - "127.0.0.1:3500:3500"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: sh -c "npm run migrate && npm run worker:demo"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      BIND_HOST: "0.0.0.0"
+      RECEIVER_URL: "http://receiver:4000/receive"
+      API_URL: "http://api:3500/events"
+      DEMO_MODE: "true"
+    ports:
+      - "127.0.0.1:4700:4700"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   hermes_pgdata:
