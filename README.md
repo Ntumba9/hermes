@@ -72,6 +72,30 @@ The control port (`127.0.0.1:4700`) only accepts requests when
 except to host loopback, and off by default everywhere else (plain
 `npm run worker` has none of this).
 
+### Demo screenshots
+
+Screenshots from a local run using synthetic data. The dashboard refreshes
+every 1.5 seconds; each image shows a sampled state.
+
+![Processing: 686 pending, 1 claimed and 242 delivered; receiver total 242.](https://github.com/user-attachments/assets/a0616070-5b4f-4cc2-b303-7b813561a2b4)
+
+![Recovery: after the simulated crash, delivered and receiver totals both reach 2,005.](https://github.com/user-attachments/assets/433365ac-9bbc-482c-a8b9-aba93ac54c40)
+
+<details>
+<summary>More screenshots</summary>
+
+![Clean start: queue counters and demo controls after reset.](https://github.com/user-attachments/assets/01642cf3-e6bf-46e8-baaf-20b7034c83c4)
+
+![Crash: one event remains claimed while the timeline records the worker crash.](https://github.com/user-attachments/assets/cccdae95-c7b1-4708-ab30-b9cf170fc935)
+
+![Event inspector: delivered event payload, attempt count and recorded history.](https://github.com/user-attachments/assets/87351cdd-db4b-4749-90c9-1367c7781c71)
+
+![Dead-letter state: with the receiver stopped, one event exhausts its retries and moves to dead.](https://github.com/user-attachments/assets/b87b2beb-b7dd-4c65-9829-65756abceab2)
+
+![Failed-event inspector: all eight failed attempts shown in the event history.](https://github.com/user-attachments/assets/c1f2ec9e-7379-4062-83fe-766c6a8fb185)
+
+</details>
+
 ## Run it without Docker
 
 ```bash
