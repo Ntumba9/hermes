@@ -2,12 +2,31 @@ import { randomUUID } from "node:crypto";
 import { pool } from "./db.js";
 import { sign } from "./signing.js";
 
-const RECEIVER_URL = "http://127.0.0.1:4000/receive"; // local-only allowlisted target
-const LEASE_SECONDS = 5;
+// local-only allowlisted target; override for Docker, where services address
+// each other by name instead of 127.0.0.1
+const RECEIVER_URL = process.env.RECEIVER_URL ?? "http://127.0.0.1:4000/receive";
+const LEASE_SECONDS = Number(process.env.LEASE_SECONDS ?? "5");
 const POLL_INTERVAL_MS = 500;
 const MAX_ATTEMPTS = 8;
 const BACKOFF_BASE_SECONDS = 2;
 const BACKOFF_CAP_SECONDS = 60;
+const CONCURRENCY = Math.max(1, Number(process.env.WORKER_CONCURRENCY ?? "1"));
+
+// Demo/test-only fault injection: the first claimed job after process start
+// that reaches this boundary makes the worker exit immediately, standing in
+// for a real SIGKILL at a precise, reproducible point. Unset by default -
+// zero effect on normal operation or the chaos test.
+type CrashPoint = "claim" | "deliver";
+const CRASH_AFTER = process.env.HERMES_CRASH_AFTER as CrashPoint | undefined;
+let crashArmed = CRASH_AFTER !== undefined;
+
+function maybeCrash(point: CrashPoint): void {
+  if (crashArmed && CRASH_AFTER === point) {
+    crashArmed = false;
+    console.log(`HERMES_CRASH_AFTER=${point}: exiting now (simulated crash)`);
+    process.exit(137);
+  }
+}
 
 type ClaimedEvent = {
   id: string;
@@ -19,7 +38,7 @@ type ClaimedEvent = {
 
 // Full jitter: pick uniformly between 0 and the exponential cap, so a batch of
 // jobs that failed together don't all retry on the same tick.
-function backoffSeconds(nextAttemptNumber: number): number {
+export function backoffSeconds(nextAttemptNumber: number): number {
   const cap = Math.min(BACKOFF_CAP_SECONDS, BACKOFF_BASE_SECONDS * 2 ** (nextAttemptNumber - 1));
   return Math.random() * cap;
 }
@@ -67,7 +86,9 @@ async function claimOne(): Promise<ClaimedEvent | null> {
   }
 }
 
-async function deliver(event: ClaimedEvent): Promise<boolean> {
+type DeliverResult = { ok: boolean; httpStatus: number | null };
+
+async function deliver(event: ClaimedEvent): Promise<DeliverResult> {
   const body = JSON.stringify(event.payload);
   try {
     const res = await fetch(RECEIVER_URL, {
@@ -79,9 +100,29 @@ async function deliver(event: ClaimedEvent): Promise<boolean> {
       },
       body,
     });
-    return res.ok;
+    return { ok: res.ok, httpStatus: res.status };
   } catch {
-    return false;
+    return { ok: false, httpStatus: null };
+  }
+}
+
+// Best-effort observability write, separate from the status update that
+// actually governs delivery. A failure here must never affect delivery
+// correctness, so errors are swallowed.
+async function logAttempt(
+  event: ClaimedEvent,
+  attemptNumber: number,
+  outcome: "delivered" | "failed",
+  httpStatus: number | null
+): Promise<void> {
+  try {
+    await pool.query(
+      `INSERT INTO activity_log (kind, event_id, attempt_number, outcome, http_status)
+       VALUES ('delivery_attempt', $1, $2, $3, $4)`,
+      [event.id, attemptNumber, outcome, httpStatus]
+    );
+  } catch (err) {
+    console.error("failed to write activity_log row (non-fatal):", err);
   }
 }
 
@@ -120,27 +161,57 @@ async function markFailed(event: ClaimedEvent): Promise<void> {
 async function runOnce(): Promise<boolean> {
   const event = await claimOne();
   if (!event) return false;
+  maybeCrash("claim");
 
-  const ok = await deliver(event);
-  if (ok) {
+  const result = await deliver(event);
+  maybeCrash("deliver");
+  const attemptNumber = event.attempts + 1;
+  if (result.ok) {
     await markDelivered(event);
   } else {
     await markFailed(event);
   }
+  await logAttempt(event, attemptNumber, result.ok ? "delivered" : "failed", result.httpStatus);
   return true;
 }
 
-async function main() {
-  console.log("HERMES worker started");
-  for (;;) {
+// shuttingDown is checked between jobs, never mid-job: SIGTERM lets whatever
+// a loop already claimed finish (deliver + mark result) before that loop
+// exits, so a graceful stop never orphans a lease the way SIGKILL can.
+let shuttingDown = false;
+
+async function runLoop(loopId: number): Promise<void> {
+  console.log(`HERMES worker loop ${loopId} started`);
+  while (!shuttingDown) {
     const didWork = await runOnce();
     if (!didWork) {
       await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
     }
   }
+  console.log(`HERMES worker loop ${loopId} stopped`);
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+async function main() {
+  console.log(`HERMES worker started (concurrency=${CONCURRENCY})`);
+  const loops = Array.from({ length: CONCURRENCY }, (_, i) => runLoop(i));
+
+  process.on("SIGTERM", () => {
+    console.log("SIGTERM received, finishing in-flight work before exit");
+    shuttingDown = true;
+  });
+
+  await Promise.all(loops);
+  await pool.end();
+  process.exit(0);
+}
+
+// Only auto-run when executed directly (`npm run worker`, or spawned as a
+// child process); importing this module for its exports (tests,
+// worker-supervisor's type-only usage) must not also start the loop.
+import { pathToFileURL } from "node:url";
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
