@@ -1,7 +1,9 @@
 # HERMES
 
-A crash-tested webhook delivery service. Postgres as the queue, no Kafka/Redis/RabbitMQ,
-no ORM. The point is proving delivery survives a worker crash, not feature count.
+A crash-tested webhook delivery service, with a live dashboard that shows
+the delivery mechanism working — and breaking, and recovering — in real
+time. Postgres as the queue, no Kafka/Redis/RabbitMQ, no ORM. The point is
+proving delivery survives a worker crash, not feature count.
 
 ## Architecture
 
@@ -11,18 +13,24 @@ POST /events ──► [events table]
  key, dedup on       │                           └→ dead (after 8 attempts)
  insert)             │
                      ▼
-              worker (polling loop)
+         worker (1..N concurrent claim loops)
    1. SELECT ... FOR UPDATE SKIP LOCKED, LIMIT 1   (claim: own transaction, commits)
    2. stamp a fresh lease_token + lease_expires_at
    3. ── commit ──
    4. HTTP POST to receiver, X-Event-Id + X-Hermes-Signature (HMAC-SHA256)  (no tx open)
    5. UPDATE events SET status = ... WHERE id = $1 AND lease_token = $2
       (stale worker whose lease was reclaimed: this WHERE matches 0 rows, no-op)
+   6. INSERT activity_log row (best-effort - feeds the dashboard, never gates delivery)
                      │
                      ▼
               demo receiver (:4000)
    verify signature → INSERT received_events (event_id) ON CONFLICT DO NOTHING
                     → side effect runs only if that insert was new, same transaction
+
+dashboard (served by api.ts, polls /api/state every 1.5s)
+   reads events + activity_log + receiver_total directly - same Postgres,
+   no cross-service calls. worker-supervisor.ts (opt-in, DEMO_MODE=true) owns
+   the worker as a child process and exposes crash/restart/seed/reset.
 ```
 
 ## The failure this survives
@@ -33,10 +41,41 @@ lease token means a half-finished claim can't be double-written by two workers, 
 the receiver's own dedup means a redelivered event never applies its side effect
 twice. At-least-once delivery + idempotent processing = effectively-once overall.
 
-## Run it
+## Control room demo
+
+One command brings up Postgres, the receiver, the API + dashboard, and a
+demo-mode worker supervisor:
 
 ```bash
-docker compose up -d
+docker compose up
+```
+
+Open **http://127.0.0.1:3500** — that's the dashboard. A reproducible
+sequence to see the whole mechanism:
+
+1. Click **Seed 20 events** — watch them go `pending → delivered` in the
+   queue-state counts and the activity timeline, receiver total climbing in
+   lockstep.
+2. Click **Crash after claim-commit** — the worker is killed the instant
+   after its *next* claim commits (a deterministic stand-in for the random
+   SIGKILL the chaos test throws at it). The timeline logs `worker_crashed`.
+3. Watch the stuck row reappear a few seconds later as the lease expires and
+   gets reclaimed — queue state drains back to all-delivered, receiver total
+   still exactly matches the event count. Nothing was lost or double-applied.
+4. Click any timeline row to open the **event inspector**: payload, every
+   delivery attempt, its HTTP status, and the recovery history for that one
+   event.
+5. Click **Reset demo** to clear the queue and run it again.
+
+The control port (`127.0.0.1:4700`) only accepts requests when
+`DEMO_MODE=true` and only from the dashboard's own origin - never published
+except to host loopback, and off by default everywhere else (plain
+`npm run worker` has none of this).
+
+## Run it without Docker
+
+```bash
+docker compose up -d postgres
 npm install
 npm run migrate
 ```
@@ -45,9 +84,13 @@ In three terminals:
 
 ```bash
 npm run receiver   # demo delivery target on :4000
-npm run api        # ingest API on :3500
-npm run worker     # claims and delivers pending events
+npm run api        # ingest API + dashboard on :3500
+npm run worker     # claims and delivers pending events (set WORKER_CONCURRENCY=N for parallel loops)
 ```
+
+For the crash/restart/seed/reset controls without Docker, run the supervisor
+instead of the plain worker (bash: `DEMO_MODE=true npm run worker:demo`;
+PowerShell: `$env:DEMO_MODE='true'; npm run worker:demo`).
 
 Send an event:
 
@@ -70,10 +113,15 @@ restarts it, and asserts zero lost events + an exactly-once side effect:
 npm run chaos
 ```
 
-`npm test` runs the dependency-free unit tests (HMAC sign/verify).
+`npm test` runs the full suite (10 tests) against a live Postgres: HMAC
+sign/verify, idempotent ingest, lease fencing, concurrent delivery, and the
+deterministic crash-after-claim-commit boundary. Test files run sequentially
+(`--test-concurrency=1`) since several of them `TRUNCATE` shared tables
+against the same database.
 
-Throughput benchmark — sends 1000 events, runs one worker with no kills, times
-send-start to the last event reaching a terminal state:
+Throughput benchmark — sends 1000 events per pass, no kills, at
+`WORKER_CONCURRENCY` 1/2/4, times send-start to the last event reaching a
+terminal state:
 
 ```bash
 npm run benchmark
@@ -85,51 +133,95 @@ to verify HERMES's signatures.
 
 ## Benchmark
 
-Single worker, single poller, local receiver, no concurrency — measures the
-mechanism's floor, not an optimized ceiling:
+1000 events per pass, local receiver, no kills, same machine and conditions
+for every row — real measured numbers, one `npm run benchmark` run:
 
-| Events | Elapsed | Throughput |
-|--------|---------|------------|
-| 1000   | 35.8s   | 27.9 events/sec |
+| WORKER_CONCURRENCY | events/sec |
+|---|---|
+| 1 | 31.0 |
+| 2 | 49.3 |
+| 4 | 254.2 |
 
-That number is bound by the worker doing one job fully sequentially — claim
-(transaction + commit), HTTP POST, mark-result (another write) — before
-polling for the next one, with a 500ms poll delay whenever it finds nothing
-to do. Running multiple worker processes against the same table is the
-obvious next lever: `SELECT ... FOR UPDATE SKIP LOCKED` is exactly what makes
-that safe without any coordination between them, since two workers polling
-concurrently just skip each other's locked rows. Not benchmarked here —
-tonight's slice was proving correctness under crash, not peak throughput.
+The 1→4 jump is bigger than linear, and that's explained by where the time
+actually goes, not by magic: each job is ~7 sequential round trips (claim's
+`BEGIN`/`SELECT ... FOR UPDATE`/`UPDATE`/`COMMIT`, one HTTP POST, the
+mark-result write, the activity-log write), none of them pipelined. At
+concurrency 1, 100% of wall-clock time is that serial chain with nothing
+else happening. At concurrency 4, four claim loops have requests in flight
+at once, so one loop's wait on a round trip overlaps with another loop
+actually doing work - Node's non-blocking I/O fills in gaps that a single
+loop leaves idle. `SELECT ... FOR UPDATE SKIP LOCKED` is exactly what makes
+this safe with zero coordination: concurrent loops just skip rows another
+transaction already has locked instead of blocking on them. Run-to-run
+variance is real (a repeat run measured 28.0 / 58.0 / 400.2) - these are
+live numbers against a real Postgres instance, not a controlled benchmark
+environment, and should be read as "concurrency clearly helps, and by more
+than you'd naively guess," not as precise throughput guarantees.
+
+## Design tradeoffs
+
+**Polling over SSE for the dashboard.** Both were reasonable. Polling every
+1.5s is fewer moving parts and no reconnect/keep-alive logic to get wrong
+live - the data doesn't need sub-second latency to make the point.
+
+**Process-level crash control, not a Docker-engine control port.** "Crash
+the worker" doesn't shell out to the Docker API or mount a Docker socket -
+that's a real dependency and a real security surface for what's fundamentally
+a demo. Instead `worker-supervisor.ts` owns the worker as a normal OS child
+process (the same `child_process.spawn` pattern the chaos test already uses)
+and can `SIGKILL`/respawn it directly. The control port is still
+loopback-only and demo-mode-gated in Docker - same safety property, without
+a socket mount.
 
 ## Status
 
-Tonight's slice and week-core mechanism are built and verified end to end:
-idempotent ingest, SKIP LOCKED + lease-token claiming (including reclaiming a
-job whose worker died mid-flight), exponential backoff with jitter and
-dead-lettering after 8 attempts, HMAC-SHA256 signing, and durable receiver-side
-dedup (event id + side effect in one transaction). `npm run chaos` passes
-consistently: 50/50 events delivered, zero lost, side-effect total exactly 50
-across repeated random SIGKILLs of the worker, with observed redeliveries
-correctly deduped. Benchmarked at 27.9 events/sec with a single worker.
+Mechanism, concurrency, and the live control room are built and verified end
+to end against a real Postgres instance: idempotent ingest, SKIP LOCKED +
+lease-token claiming with N concurrent claim loops, expired-lease reclaim,
+exponential backoff with jitter, dead-lettering after 8 attempts, HMAC-SHA256
+signing, durable receiver-side dedup, a live dashboard, and an on-demand
+crash-and-recover demo (both a random SIGKILL and a deterministic
+crash-after-claim-commit, each one triggerable from the dashboard and each
+one auto-recovered and visible in the timeline). `npm test` (10/10) and
+`npm run chaos` (50/50, zero lost) both pass. `docker compose up` was run and
+verified live: all four services built and started, the dashboard loaded,
+seeding/crashing/reclaiming/inspecting all worked through the real browser UI.
 
 ## What works / limitations (updated each session)
 
 See commit history for the running log.
 
 **What works (verified against a real Postgres, not just type-checked):**
-idempotent ingest, claim/lease/deliver/mark-result, expired-lease reclaim,
-backoff + dead-letter, HMAC sign/verify, receiver dedup. `npm test` (4/4) and
-`npm run chaos` both pass.
+idempotent ingest, claim/lease/deliver/mark-result at concurrency 1-4,
+expired-lease reclaim (both random-timing and the deterministic
+claim-commit boundary), backoff + dead-letter, HMAC sign/verify, receiver
+dedup under concurrent delivery, the dashboard's live state/timeline/
+inspector, and the crash/restart/seed/reset control routes (demo-mode-gated,
+origin-checked, loopback-only). `npm test` (10/10) and `npm run chaos` both
+pass.
 
-**How to run the proof:** `docker compose up -d && npm run migrate && npm run chaos`.
+**How to run the proof:** `docker compose up` then open
+`http://127.0.0.1:3500` and use the Crash after claim-commit button - or,
+without Docker, `docker compose up -d postgres && npm run migrate && npm run chaos`
+for the automated version.
 
-**Honest limitation:** the chaos test's kill timing (400ms-2.5s between
-SIGKILLs) was tuned by hand against one machine's `tsx` cold-start overhead,
-not derived from first principles - a much faster or slower machine might need
-different numbers to actually interrupt mid-flight work instead of mostly
-killing process startup. The benchmark (27.9 events/sec) is a single
-unoptimized worker, not a ceiling - it was never the point of this project to
-push that number up.
+**Honest limitations:**
+- HERMES guarantees **at-least-once delivery plus receiver-side
+  idempotency** - not exactly-once delivery and not a zero-loss guarantee in
+  any absolute sense. Duplicate concurrent delivery attempts for the same
+  event are possible and expected (a job can legitimately outlive its lease
+  and get reclaimed while the original HTTP call is still in flight); the
+  receiver's own dedup transaction is what makes that safe, not the absence
+  of duplicates.
+- The chaos test's kill timing (400ms-2.5s between SIGKILLs) was tuned by
+  hand against one machine's `tsx` cold-start overhead, not derived from
+  first principles - a much faster or slower machine might need different
+  numbers to actually interrupt mid-flight work instead of mostly killing
+  process startup. The deterministic `HERMES_CRASH_AFTER` boundary test
+  doesn't have this problem, by construction - it only proves that one exact
+  boundary, which is the honest tradeoff for determinism.
+- Benchmark numbers are real but noisy (see Benchmark section) - read as
+  directional, not as a performance SLA.
 
 ## What I learned
 
@@ -169,3 +261,29 @@ Early on I nearly used plain exponential backoff (no randomization) since it
 that all fail together still retries in lockstep, just on a longer delay.
 `Math.random() * cap` instead of a fixed delay per attempt is what actually
 spreads the batch out.
+
+**Integration tests that share a real database need explicit isolation, and
+I found that out the hard way.** The first time I ran the full suite with
+the new concurrency and crash-boundary tests added, two tests failed with
+bizarre, non-deterministic-looking errors - an idempotency check that should
+never fail, and a crash-recovery test that saw its event vanish mid-check.
+The cause wasn't a mechanism bug: Node's test runner runs separate test
+*files* concurrently by default, and several of my new files `TRUNCATE` the
+same tables against the same live Postgres instance. Two files running at
+once meant one test's cleanup wiped another test's fixture out from under
+it, mid-assertion. Forcing `--test-concurrency=1` fixed it immediately. The
+lesson generalizes past this project: process isolation (separate Node
+processes per test file) is not the same thing as data isolation, and tests
+that share a stateful external resource need to say so explicitly rather
+than relying on accidents of scheduling.
+
+**A feature isn't verified until it's run through the actual UI, in a real
+browser.** `tsc` was clean and the Dockerized stack came up cleanly on the
+first try, but the dashboard's demo-control panel silently never appeared -
+the browser was blocking the cross-origin fetch from the dashboard's origin
+to the control server's port, and my server never sent an
+`Access-Control-Allow-Origin` header, so the request failed before my
+same-origin check on the server side ever ran. Nothing in `tsc`, `npm test`,
+or a `curl` smoke test would have caught that - only a real browser enforces
+CORS. Fixed by echoing back the origin when (and only when) it's on the same
+allowlist the server-side check already used.
