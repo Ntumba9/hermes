@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>HERMES control room</title>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --panel: #121622;
+    --panel-border: #232a3d;
+    --text: #e6e9f2;
+    --muted: #8993ab;
+    --pending: #f5a623;
+    --claimed: #4a90d9;
+    --delivered: #2ecc71;
+    --dead: #e74c3c;
+    --accent: #7c5cff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+    padding: 16px;
+  }
+  h1 { font-size: 1.1rem; margin: 0 0 4px; font-weight: 600; }
+  .subtitle { color: var(--muted); font-size: 0.85rem; margin-bottom: 20px; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  .panel h2 {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    margin: 0 0 12px;
+    font-weight: 600;
+  }
+  .counts { display: flex; gap: 12px; flex-wrap: wrap; }
+  .count-chip {
+    flex: 1;
+    min-width: 90px;
+    border-radius: 8px;
+    padding: 10px 12px;
+    text-align: center;
+    border: 1px solid var(--panel-border);
+  }
+  .count-chip .n { font-size: 1.6rem; font-weight: 700; display: block; }
+  .count-chip .label { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; }
+  .count-chip.pending { border-color: var(--pending); } .count-chip.pending .n { color: var(--pending); }
+  .count-chip.claimed { border-color: var(--claimed); } .count-chip.claimed .n { color: var(--claimed); }
+  .count-chip.delivered { border-color: var(--delivered); } .count-chip.delivered .n { color: var(--delivered); }
+  .count-chip.dead { border-color: var(--dead); } .count-chip.dead .n { color: var(--dead); }
+  .receiver-total { font-size: 2rem; font-weight: 700; color: var(--accent); }
+  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  th { text-align: left; color: var(--muted); font-weight: 600; padding: 4px 8px; font-size: 0.72rem; text-transform: uppercase; }
+  td { padding: 6px 8px; border-top: 1px solid var(--panel-border); }
+  tr.activity-row { cursor: pointer; }
+  tr.activity-row:hover { background: #1a2032; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 0.72rem; font-weight: 600; }
+  .badge.delivered { background: rgba(46,204,113,0.15); color: var(--delivered); }
+  .badge.failed { background: rgba(231,76,60,0.15); color: var(--dead); }
+  .badge.worker_crashed { background: rgba(231,76,60,0.15); color: var(--dead); }
+  .badge.worker_restarted { background: rgba(74,144,217,0.15); color: var(--claimed); }
+  .badge.demo_reset, .badge.demo_seed { background: rgba(124,92,255,0.15); color: var(--accent); }
+  .timeline-scroll { max-height: 360px; overflow-y: auto; }
+  #controlPanel { display: none; }
+  #controlPanel.visible { display: block; }
+  .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  button {
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 0.82rem;
+    cursor: pointer;
+  }
+  button:hover { opacity: 0.85; }
+  button.danger { background: var(--dead); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  #inspector { display: none; }
+  #inspector.visible { display: block; }
+  pre { background: #0b0e14; border: 1px solid var(--panel-border); border-radius: 6px; padding: 10px; overflow-x: auto; font-size: 0.78rem; }
+  .close-btn { float: right; background: transparent; color: var(--muted); padding: 2px 8px; }
+  .status-text { font-size: 0.82rem; color: var(--muted); margin-top: 8px; }
+</style>
+</head>
+<body>
+  <h1>HERMES control room</h1>
+  <div class="subtitle">Live view of a Postgres-queue webhook delivery pipeline. Polls every 1.5s.</div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>Queue state</h2>
+      <div class="counts" id="counts"></div>
+    </div>
+    <div class="panel">
+      <h2>Receiver side effect total</h2>
+      <div class="receiver-total" id="receiverTotal">-</div>
+      <div class="status-text">Should equal delivered-count worth of events, exactly once each, even across redeliveries.</div>
+    </div>
+    <div class="panel" id="controlPanel">
+      <h2>Demo controls</h2>
+      <div class="btn-row">
+        <button id="btnSeed">Seed 20 events</button>
+        <button id="btnCrashRandom" class="danger">Crash now (random point)</button>
+        <button id="btnCrashClaim" class="danger">Crash after claim-commit</button>
+        <button id="btnRestart">Restart worker</button>
+        <button id="btnReset" class="danger">Reset demo</button>
+      </div>
+      <div class="status-text" id="controlStatus"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Activity timeline</h2>
+    <div class="timeline-scroll">
+      <table>
+        <thead><tr><th>Time</th><th>Kind</th><th>Event</th><th>Detail</th></tr></thead>
+        <tbody id="timelineBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel" id="inspector">
+    <button class="close-btn" id="closeInspector">close ✕</button>
+    <h2>Event inspector</h2>
+    <div id="inspectorBody"></div>
+  </div>
+
+<script>
+const CONTROL_PORT = 4700;
+let controlBase = null;
+
+async function pollState() {
+  try {
+    const res = await fetch('/api/state');
+    const data = await res.json();
+    renderCounts(data.statusCounts);
+    document.getElementById('receiverTotal').textContent = data.receiverTotal;
+    renderTimeline(data.recentActivity);
+  } catch (err) {
+    console.error('poll failed', err);
+  }
+}
+
+function renderCounts(counts) {
+  const el = document.getElementById('counts');
+  const order = ['pending', 'claimed', 'delivered', 'dead'];
+  el.innerHTML = order.map(k =>
+    `<div class="count-chip ${k}"><span class="n">${counts[k] ?? 0}</span><span class="label">${k}</span></div>`
+  ).join('');
+}
+
+function renderTimeline(rows) {
+  const body = document.getElementById('timelineBody');
+  body.innerHTML = rows.map(r => {
+    const time = new Date(r.created_at).toLocaleTimeString();
+    const kindBadge = `<span class="badge ${r.outcome || r.kind}">${r.outcome || r.kind}</span>`;
+    const eventShort = r.event_id ? r.event_id.slice(0, 8) : '-';
+    const detail = r.http_status ? `http ${r.http_status}` : (r.detail || '');
+    const clickable = r.event_id ? `class="activity-row" data-event-id="${r.event_id}"` : '';
+    return `<tr ${clickable}><td>${time}</td><td>${kindBadge}</td><td>${eventShort}</td><td>${detail}</td></tr>`;
+  }).join('');
+  body.querySelectorAll('tr.activity-row').forEach(tr => {
+    tr.addEventListener('click', () => openInspector(tr.dataset.eventId));
+  });
+}
+
+async function openInspector(eventId) {
+  const res = await fetch(`/api/events/${eventId}`);
+  if (!res.ok) return;
+  const data = await res.json();
+  const el = document.getElementById('inspector');
+  const body = document.getElementById('inspectorBody');
+  body.innerHTML = `
+    <p><strong>ID:</strong> ${data.event.id}</p>
+    <p><strong>Status:</strong> ${data.event.status} — <strong>attempts:</strong> ${data.event.attempts}</p>
+    <p><strong>Payload (synthetic demo data):</strong></p>
+    <pre>${JSON.stringify(data.event.payload, null, 2)}</pre>
+    <p><strong>Recovery history:</strong></p>
+    <pre>${data.activity.map(a =>
+      `${new Date(a.created_at).toLocaleTimeString()}  attempt ${a.attempt_number ?? '-'}  ${a.outcome ?? a.kind}  http=${a.http_status ?? '-'}`
+    ).join('\n')}</pre>
+  `;
+  el.classList.add('visible');
+}
+
+document.getElementById('closeInspector').addEventListener('click', () => {
+  document.getElementById('inspector').classList.remove('visible');
+});
+
+// The demo control server is a separate process/port (worker-supervisor.ts),
+// off by default. Probe it; only show the control panel if it answers.
+async function probeDemoMode() {
+  const base = `http://${location.hostname}:${CONTROL_PORT}`;
+  try {
+    const res = await fetch(`${base}/api/demo/mode`);
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.enabled) {
+      controlBase = base;
+      document.getElementById('controlPanel').classList.add('visible');
+    }
+  } catch {
+    // supervisor not running - dashboard stays read-only, which is fine
+  }
+}
+
+async function postDemo(path, body) {
+  if (!controlBase) return;
+  const statusEl = document.getElementById('controlStatus');
+  try {
+    const res = await fetch(`${controlBase}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await res.json().catch(() => ({}));
+    statusEl.textContent = res.ok ? (data.message || 'ok') : (data.error || 'failed');
+  } catch (err) {
+    statusEl.textContent = 'request failed: ' + err.message;
+  }
+}
+
+document.getElementById('btnSeed').addEventListener('click', () => postDemo('/api/demo/seed', { count: 20 }));
+document.getElementById('btnCrashRandom').addEventListener('click', () => postDemo('/api/demo/crash', { point: 'random' }));
+document.getElementById('btnCrashClaim').addEventListener('click', () => postDemo('/api/demo/crash', { point: 'after-claim' }));
+document.getElementById('btnRestart').addEventListener('click', () => postDemo('/api/demo/restart'));
+document.getElementById('btnReset').addEventListener('click', () => postDemo('/api/demo/reset'));
+
+pollState();
+probeDemoMode();
+setInterval(pollState, 1500);
+setInterval(probeDemoMode, 5000);
+</script>
+</body>
+</html>

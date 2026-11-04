@@ -1,9 +1,17 @@
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import { pool } from "./db.js";
 
-const PORT = 3500;
-const HOST = "127.0.0.1";
+const PORT = Number(process.env.PORT ?? "3500");
+// Default 127.0.0.1 for local dev; Docker overrides to 0.0.0.0 inside the
+// container and restricts host access via its own port-publish instead.
+const HOST = process.env.BIND_HOST ?? "127.0.0.1";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const PUBLIC_DIR = join(__dirname, "..", "public");
 
 async function readBody(req: import("node:http").IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
@@ -19,6 +27,15 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && req.url?.startsWith("/events")) {
       return await handleListEvents(req, res);
     }
+    if (req.method === "GET" && req.url === "/api/state") {
+      return await handleDashboardState(req, res);
+    }
+    if (req.method === "GET" && req.url?.startsWith("/api/events/")) {
+      return await handleEventDetail(req, res);
+    }
+    if (req.method === "GET" && (req.url === "/" || req.url === "/dashboard")) {
+      return await serveStatic(res, "dashboard.html", "text/html");
+    }
     res.writeHead(404, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: "not found" }));
   } catch (err) {
@@ -27,6 +44,92 @@ const server = createServer(async (req, res) => {
     res.end(JSON.stringify({ error: "internal error" }));
   }
 });
+
+async function serveStatic(
+  res: import("node:http").ServerResponse,
+  filename: string,
+  contentType: string
+) {
+  try {
+    const body = await readFile(join(PUBLIC_DIR, filename));
+    res.writeHead(200, { "content-type": contentType });
+    res.end(body);
+  } catch {
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "not found" }));
+  }
+}
+
+// Dashboard summary: counts by status, the receiver's own side-effect total
+// (same Postgres instance, no cross-service call needed), and the most
+// recent activity for the timeline.
+async function handleDashboardState(
+  req: import("node:http").IncomingMessage,
+  res: import("node:http").ServerResponse
+) {
+  const [counts, receiverTotal, recentActivity] = await Promise.all([
+    pool.query<{ status: string; count: string }>(
+      `SELECT status, count(*) FROM events GROUP BY status`
+    ),
+    pool.query<{ total: string }>(`SELECT total FROM receiver_total WHERE id = true`),
+    pool.query(
+      `SELECT id, kind, event_id, attempt_number, outcome, http_status, detail, created_at
+       FROM activity_log ORDER BY created_at DESC LIMIT 50`
+    ),
+  ]);
+
+  const statusCounts: Record<string, number> = { pending: 0, claimed: 0, delivered: 0, dead: 0 };
+  for (const row of counts.rows) {
+    statusCounts[row.status] = Number(row.count);
+  }
+
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(
+    JSON.stringify({
+      statusCounts,
+      receiverTotal: Number(receiverTotal.rows[0]?.total ?? 0),
+      recentActivity: recentActivity.rows,
+    })
+  );
+}
+
+// Event inspector: one event's record plus its full activity_log history
+// (every attempt, outcome, and http_status - never signing keys or
+// credentials, which never enter this table in the first place).
+async function handleEventDetail(
+  req: import("node:http").IncomingMessage,
+  res: import("node:http").ServerResponse
+) {
+  const id = req.url?.split("/api/events/")[1]?.split("?")[0];
+  if (!id) {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "event id required" }));
+    return;
+  }
+
+  const [eventResult, activityResult] = await Promise.all([
+    pool.query(
+      `SELECT id, idempotency_key, payload, status, attempts, next_attempt_at,
+              lease_expires_at, created_at
+       FROM events WHERE id = $1`,
+      [id]
+    ),
+    pool.query(
+      `SELECT kind, attempt_number, outcome, http_status, detail, created_at
+       FROM activity_log WHERE event_id = $1 ORDER BY created_at ASC`,
+      [id]
+    ),
+  ]);
+
+  if (eventResult.rows.length === 0) {
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "not found" }));
+    return;
+  }
+
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(JSON.stringify({ event: eventResult.rows[0], activity: activityResult.rows }));
+}
 
 async function handleCreateEvent(
   req: import("node:http").IncomingMessage,
