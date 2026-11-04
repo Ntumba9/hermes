@@ -2,8 +2,8 @@ import { createServer } from "node:http";
 import { pool } from "./db.js";
 import { verify } from "./signing.js";
 
-const PORT = 4000;
-const HOST = "127.0.0.1";
+const PORT = Number(process.env.PORT ?? "4000");
+const HOST = process.env.BIND_HOST ?? "127.0.0.1";
 
 async function readBody(req: import("node:http").IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
