@@ -7,10 +7,11 @@
     "migrate": "tsx src/migrate.ts",
     "api": "tsx src/api.ts",
     "worker": "tsx src/worker.ts",
+    "worker:demo": "tsx src/worker-supervisor.ts",
     "receiver": "tsx src/receiver.ts",
     "chaos": "tsx src/chaos.ts",
     "benchmark": "tsx src/benchmark.ts",
-    "test": "node --import tsx --test src/**/*.test.ts"
+    "test": "node --import tsx --test --test-concurrency=1 src/**/*.test.ts"
   },
   "dependencies": {
     "pg": "^8.13.1"
