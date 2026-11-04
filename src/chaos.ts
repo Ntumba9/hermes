@@ -37,8 +37,7 @@ async function waitForHttp(url: string, timeoutMs = 10_000): Promise<void> {
 }
 
 async function resetState(): Promise<void> {
-  await pool.query("TRUNCATE events");
-  await pool.query("TRUNCATE received_events");
+  await pool.query("TRUNCATE events, received_events, activity_log");
   await pool.query("UPDATE receiver_total SET total = 0 WHERE id = true");
 }
 
